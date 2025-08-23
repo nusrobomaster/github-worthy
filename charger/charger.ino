@@ -1,9 +1,8 @@
-/**
- * WPT Charger - NimBLE Peripheral (Server)
- * - Bonding via Numeric Comparison during a physical pairing window
- * - Rejects unbonded peers otherwise
- * - One connection only, 10 s same-peer cooldown after disconnect
- */
+// ===== WPT Charger (Peripheral/Server) =====
+// 1-button: short press -> pairing window 30s
+// Accepts new bonds only while window open; otherwise bonded-only.
+// One connection max; 10s same-peer cooldown.
+// Advertises 1-byte manufacturer data: 0=normal, 1=pairing window.
 
 #include <Arduino.h>
 #include <NimBLEDevice.h>
@@ -11,7 +10,7 @@
 static const char* DEVICE_NAME = "WPT_Charger";
 
 // ---- Pins ----
-const int PIN_PAIR_BTN = 0;            // press to open pairing window
+const int PIN_PAIR_BTN = 0;            // change to your board
 
 // ---- Timers ----
 const uint32_t PAIR_WINDOW_MS        = 30000;   // 30 s pairing window
@@ -26,81 +25,68 @@ NimBLEServer*          gServer        = nullptr;
 NimBLEAdvertising*     gAdv           = nullptr;
 NimBLECharacteristic*  gCtrl          = nullptr;
 
-volatile bool   g_pairMode       = false;
-uint32_t        g_pairModeUntil  = 0;
+volatile bool   g_pairMode      = false;
+uint32_t        g_pairModeUntil = 0;
 
-bool            g_connected      = false;
-bool            g_hasLastPeer    = false;
+bool            g_connected     = false;
+bool            g_hasLastPeer   = false;
 NimBLEAddress   g_lastPeer;
-uint32_t        g_lastDiscMs     = 0;
+uint32_t        g_lastDiscMs    = 0;
 
-uint32_t        g_passkey        = 123456;      // used only if you swap to Passkey method
+uint32_t        g_passkey       = 123456; // not used for Numeric Comparison; harmless
 
-// --- Advertising helper ---
+// --- Advertise 1 byte: 1=pairing open, 0=closed ---
+static void updatePairFlag() {
+  if (!gAdv) return;
+  std::string md(1, (g_pairMode && (millis() < g_pairModeUntil)) ? char(1) : char(0));
+  gAdv->setManufacturerData(md);
+}
+
 static void startAdvertising(bool fast = true) {
   if (!gAdv) return;
   gAdv->stop();
 
-  if (fast) {
-    gAdv->setMinInterval(48);  // 30ms (0.625ms units)
-    gAdv->setMaxInterval(80);  // 50ms
-  } else {
-    gAdv->setMinInterval(160); // 100ms
-    gAdv->setMaxInterval(160);
-  }
+  if (fast) { gAdv->setMinInterval(48);  gAdv->setMaxInterval(80);  }  // 30–50 ms
+  else       { gAdv->setMinInterval(160); gAdv->setMaxInterval(160); } // 100 ms
 
+  updatePairFlag();
   gAdv->start();
   Serial.println("[Charger] Advertising...");
 }
 
-// --- Control characteristic callback ---
 class CtrlCB : public NimBLECharacteristicCallbacks {
   void onWrite(NimBLECharacteristic* c, NimBLEConnInfo& connInfo) override {
     const std::string& d = c->getValue();
     Serial.printf("[Charger] RX %u bytes from %s\n",
                   (unsigned)d.size(), connInfo.getAddress().toString().c_str());
-    // TODO: parse & act on control data here
+    // TODO: act on control frame
   }
 } ctrlCB;
 
-// --- Server callbacks (includes security hooks in this NimBLE build) ---
 class ServerCB : public NimBLEServerCallbacks {
   void onConnect(NimBLEServer* s, NimBLEConnInfo& connInfo) override {
     const NimBLEAddress peer = connInfo.getAddress();
     const bool bonded = NimBLEDevice::isBonded(peer);
     const bool windowOpen = g_pairMode && (millis() < g_pairModeUntil);
 
-    // Enforce single connection
-    if (g_connected) {
-      Serial.println("[Charger] Already connected; dropping new attempt.");
-      s->disconnect(connInfo.getConnHandle());
-      return;
+    if (g_connected) { s->disconnect(connInfo.getConnHandle()); return; }
+
+    if (!bonded && !windowOpen) { // bonded-only outside pairing window
+      Serial.printf("[Charger] Reject unbonded %s (pair window closed)\n", peer.toString().c_str());
+      s->disconnect(connInfo.getConnHandle()); return;
     }
 
-    // Reject non-bonded peers unless pairing window is open
-    if (!bonded && !windowOpen) {
-      Serial.printf("[Charger] Rejecting unbonded %s\n", peer.toString().c_str());
-      s->disconnect(connInfo.getConnHandle());
-      return;
-    }
-
-    // Enforce same-peer cooldown
     if (g_hasLastPeer && peer.equals(g_lastPeer) &&
         (millis() - g_lastDiscMs) < RECONNECT_COOLDOWN_MS) {
       Serial.printf("[Charger] %s within cooldown -> disconnect.\n", peer.toString().c_str());
-      s->disconnect(connInfo.getConnHandle());
-      return;
+      s->disconnect(connInfo.getConnHandle()); return;
     }
 
     g_connected = true;
-    Serial.printf("[Charger] Connected: %s  bonded=%d\n",
-                  peer.toString().c_str(), bonded);
+    Serial.printf("[Charger] Connected: %s bonded=%d\n", peer.toString().c_str(), bonded);
 
-    // Tight connection params: CI 7.5–15 ms, latency 0, timeout 500 ms
-    s->updateConnParams(connInfo.getConnHandle(), 6, 12, 0, 50);
-
-    // Stop advertising while connected to avoid other attempts
-    if (gAdv) gAdv->stop();
+    s->updateConnParams(connInfo.getConnHandle(), 6, 12, 0, 50); // 7.5–15 ms, 0, 500 ms
+    if (gAdv) gAdv->stop(); // no second client
   }
 
   void onDisconnect(NimBLEServer* s, NimBLEConnInfo& connInfo, int reason) override {
@@ -109,33 +95,26 @@ class ServerCB : public NimBLEServerCallbacks {
     g_lastPeer    = connInfo.getAddress();
     g_hasLastPeer = true;
     g_lastDiscMs  = millis();
-
-    Serial.printf("[Charger] Disconnected from %s. Cooldown 10s.\n",
-                  g_lastPeer.toString().c_str());
-
+    Serial.printf("[Charger] Disconnected from %s\n", g_lastPeer.toString().c_str());
     startAdvertising(true);
   }
 
   void onMTUChange(uint16_t MTU, NimBLEConnInfo& connInfo) override {
-    Serial.printf("[Charger] MTU -> %u from %s\n",
-                  MTU, connInfo.getAddress().toString().c_str());
+    Serial.printf("[Charger] MTU -> %u from %s\n", MTU, connInfo.getAddress().toString().c_str());
   }
 
-  // --- Security (Numeric Comparison path) ---
+  // Numeric Comparison auto-confirm
   void onConfirmPassKey(NimBLEConnInfo& connInfo, uint32_t pass_key) override {
-    Serial.printf("[Charger] Numeric comparison: %06u (auto-accept here)\n", pass_key);
-    // TODO: replace with a real UI/button confirmation
+    Serial.printf("[Charger] Compare: %06u (auto-accept)\n", pass_key);
     NimBLEDevice::injectConfirmPasskey(connInfo, true);
   }
 
   void onAuthenticationComplete(NimBLEConnInfo& connInfo) override {
     if (!connInfo.isEncrypted()) {
-      Serial.println("[Charger] Encryption failed -> disconnecting");
-      NimBLEDevice::getServer()->disconnect(connInfo.getConnHandle());
-      return;
+      Serial.println("[Charger] Encryption failed -> disconnect");
+      NimBLEDevice::getServer()->disconnect(connInfo.getConnHandle()); return;
     }
-    Serial.printf("[Charger] Secured link to %s  bonded=%d\n",
-                  connInfo.getAddress().toString().c_str(), connInfo.isBonded());
+    Serial.printf("[Charger] Secured, bonded=%d\n", connInfo.isBonded());
   }
 } serverCB;
 
@@ -147,13 +126,10 @@ void setup() {
   NimBLEDevice::init(DEVICE_NAME);
   NimBLEDevice::setPower(ESP_PWR_LVL_P9);
   NimBLEDevice::setMTU(247);
+  NimBLEDevice::setSecurityAuth(true, true, true);           // bond+MITM+SC
+  NimBLEDevice::setSecurityIOCap(BLE_HS_IO_DISPLAY_YESNO);   // Numeric Comparison
+  NimBLEDevice::setSecurityPasskey(g_passkey);               // unused for NC
 
-  // Security: Bond + MITM + LE Secure Connections (Numeric Comparison)
-  NimBLEDevice::setSecurityAuth(true, true, true);
-  NimBLEDevice::setSecurityIOCap(BLE_HS_IO_DISPLAY_YESNO);
-  NimBLEDevice::setSecurityPasskey(g_passkey);
-
-  // GATT
   gServer = NimBLEDevice::createServer();
   gServer->setCallbacks(&serverCB);
 
@@ -163,33 +139,32 @@ void setup() {
   gCtrl->setCallbacks(&ctrlCB);
   svc->start();
 
-  // Advertising
   gAdv = NimBLEDevice::getAdvertising();
   gAdv->addServiceUUID(SVC_UUID);
   startAdvertising(true);
 }
 
 void loop() {
-  // Pairing window: open on button press; auto-closes after 30 s
-  static bool was = false;
+  static bool prev = true;
   bool now = (digitalRead(PIN_PAIR_BTN) == LOW);
-  if (now && !was) {
+
+  // short press: open 30s pairing window
+  if (now && !prev) {
     g_pairMode = true;
     g_pairModeUntil = millis() + PAIR_WINDOW_MS;
+    updatePairFlag();
     Serial.println("[Charger] Pairing window OPEN (30 s)");
   }
   if (g_pairMode && millis() > g_pairModeUntil) {
     g_pairMode = false;
+    updatePairFlag();
     Serial.println("[Charger] Pairing window CLOSED");
   }
-  was = now;
+  prev = now;
 
-  // (Optional) slow advertising after ~8 s idle
+  // Optional: slow ADV after idle
   static uint32_t t0 = millis();
-  if (!g_connected && (millis() - t0) > 8000) {
-    startAdvertising(false);
-    t0 = millis();
-  }
+  if (!g_connected && (millis() - t0) > 8000) { startAdvertising(false); t0 = millis(); }
 
   delay(10);
 }

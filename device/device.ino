@@ -1,15 +1,35 @@
+// ===== WPT Device (Central/Client) =====
+// 1-button:
+//  - short press: toggle TX on/off (connect/disconnect)
+//  - long press (>=1.5s): enter pairing-attempt mode for 30s
+//    -> will connect to unknown chargers only if their adv "pair flag" == 1
+// Remembers bonded charger addresses in NVS Preferences.
+
 #include <Arduino.h>
+#include <Preferences.h>
 #include <NimBLEDevice.h>
 
 static const char* DEVICE_NAME = "WPT_Device";
+
+// ---- Pins ----
 const int PIN_USER_BTN = 0;
 
+// ---- Press timings ----
+const uint32_t LONG_PRESS_MS   = 1500;
+const uint32_t PAIR_ATTEMPT_MS = 30000;
+
+// ---- GATT UUIDs ----
 #define SVC_UUID  "180F"
 #define CTRL_UUID "2A19"
 
+// ---- State ----
 NimBLEClient*               gClient = nullptr;
 NimBLERemoteService*        gSvc    = nullptr;
 NimBLERemoteCharacteristic* gCtrl   = nullptr;
+
+bool         g_txEnabled   = false;   // set by short press
+bool         g_pairAttempt = false;   // set by long press
+uint32_t     g_pairUntil   = 0;
 
 bool         g_connected   = false;
 bool         g_scanning    = false;
@@ -18,46 +38,80 @@ NimBLEAddress g_targetAddr;
 
 uint32_t g_passkey = 123456;
 
-// ---------- Client callbacks (simple signatures for your build) ----------
+Preferences prefs;
+
+// ---- Remember bonded chargers (addresses as CSV) ----
+bool isRemembered(const NimBLEAddress& a) {
+  prefs.begin("wpt", true);
+  String list = prefs.getString("peers", "");
+  prefs.end();
+  String t = String(a.toString().c_str());
+  t.toUpperCase(); list.toUpperCase();
+  return list.indexOf(t) >= 0;
+}
+void rememberBond(const NimBLEAddress& a) {
+  prefs.begin("wpt", false);
+  String list = prefs.getString("peers", "");
+  String addr = String(a.toString().c_str());
+  if (list.length() == 0) list = addr;
+  else if (list.indexOf(addr) < 0) list += "," + addr;
+  prefs.putString("peers", list);
+  prefs.end();
+}
+
+// ---- Client callbacks (simple signatures) ----
 class ClientCB : public NimBLEClientCallbacks {
   void onConnect(NimBLEClient* c) override {
     Serial.println("[Device] Connected");
-    c->updateConnParams(6, 12, 0, 50); // CI 7.5–15 ms, latency 0, timeout 500 ms
+    c->updateConnParams(6, 12, 0, 50); // 7.5–15 ms, 0, 500 ms
   }
   void onDisconnect(NimBLEClient* c, int reason) override {
-    (void)c;
-    Serial.printf("[Device] Disconnected, reason=%d\n", reason);
+    (void)c; Serial.printf("[Device] Disconnected, reason=%d\n", reason);
     g_connected  = false;
-    g_haveTarget = false; // forget target so we can rescan
+    g_haveTarget = false;
   }
-  // Numeric Comparison (lowercase 'k' in this API)
-  void onConfirmPasskey(NimBLEConnInfo& connInfo, uint32_t pass_key) override {
-    Serial.printf("[Device] Compare: %06u (auto-accept)\n", pass_key);
-    NimBLEDevice::injectConfirmPasskey(connInfo, true);
+  // Numeric Comparison auto-confirm (lowercase k in this API)
+  void onConfirmPasskey(NimBLEConnInfo& ci, uint32_t pin) override {
+    Serial.printf("[Device] Compare: %06u (auto-accept)\n", pin);
+    NimBLEDevice::injectConfirmPasskey(ci, true);
   }
-  void onAuthenticationComplete(NimBLEConnInfo& connInfo) override {
-    if (!connInfo.isEncrypted()) {
+  void onAuthenticationComplete(NimBLEConnInfo& ci) override {
+    if (!ci.isEncrypted()) {
       Serial.println("[Device] Encryption failed -> disconnect");
-      NimBLEDevice::getClientByHandle(connInfo.getConnHandle())->disconnect();
+      NimBLEDevice::getClientByHandle(ci.getConnHandle())->disconnect();
       return;
     }
-    Serial.printf("[Device] Secured, bonded=%d\n", connInfo.isBonded());
+    if (ci.isBonded()) rememberBond(ci.getAddress());
+    Serial.printf("[Device] Secured, bonded=%d\n", ci.isBonded());
   }
 } clientCB;
 
-// ---------- Scan callbacks (lightweight) ----------
+// ---- Scanner (don’t connect in callback; just queue) ----
 class ScanCB : public NimBLEScanCallbacks {
   void onResult(const NimBLEAdvertisedDevice* adv) override {
     if (g_connected || g_haveTarget) return;
+    if (!g_txEnabled) return; // only when TX is enabled
     if (!adv->isAdvertisingService(NimBLEUUID(SVC_UUID))) return;
 
-    g_targetAddr = adv->getAddress(); // copy address (don’t hold volatile pointers)
+    // Read charger pairing flag from manufacturer data (1 byte)
+    bool pairingFlag = false;
+    const std::string md = adv->getManufacturerData();
+    if (!md.empty()) pairingFlag = ((uint8_t)md[0] == 1);
+
+    const NimBLEAddress addr = adv->getAddress();
+    const bool known = isRemembered(addr);
+
+    // Rule: connect if known; OR if in pairAttempt window AND charger says pairing open
+    if (!known) {
+      if (!(g_pairAttempt && (millis() < g_pairUntil) && pairingFlag)) return;
+    }
+
+    g_targetAddr = addr;
     g_haveTarget = true;
+    Serial.printf("[Device] Found charger %s (known=%d pairing=%d) -> queue connect\n",
+                  addr.toString().c_str(), known, pairingFlag);
 
-    Serial.printf("[Device] Found charger %s RSSI=%d (queuing connect)\n",
-                  g_targetAddr.toString().c_str(), adv->getRSSI());
-
-    NimBLEDevice::getScan()->stop(); // stop scanning; connect later in loop()
+    NimBLEDevice::getScan()->stop();
     g_scanning = false;
   }
 } scanCB;
@@ -65,12 +119,12 @@ class ScanCB : public NimBLEScanCallbacks {
 static inline void startScanFast() {
   if (g_scanning) return;
   NimBLEScan* s = NimBLEDevice::getScan();
-  s->setScanCallbacks(&scanCB, false); // no duplicates
+  s->setScanCallbacks(&scanCB, false); // no duplicates stored
   s->setActiveScan(true);
   s->setInterval(48); // 30 ms
   s->setWindow(48);   // 30 ms
   s->setMaxResults(0);
-  s->start(0, false, true);           // forever, not-continue, restart fresh
+  s->start(0, false, true);           // forever
   g_scanning = true;
   Serial.println("[Device] Scanning...");
 }
@@ -80,7 +134,7 @@ static inline void stopScan() {
   g_scanning = false;
 }
 
-// ---------- Safe connect routine (called from loop, not from callback) ----------
+// Connect outside callbacks
 bool connectToTarget() {
   if (!g_haveTarget) return false;
 
@@ -94,27 +148,21 @@ bool connectToTarget() {
   Serial.printf("[Device] Connecting to %s ...\n", g_targetAddr.toString().c_str());
   if (!gClient->connect(g_targetAddr)) {
     Serial.println("[Device] Connect failed; will rescan");
-    // Do NOT delete client here; just reuse it next time.
-    g_haveTarget = false;
+    g_haveTarget = false; // forget and rescan (don’t delete client here)
     return false;
   }
 
   g_connected = true;
   Serial.println("[Device] Connected; securing link...");
-  gClient->secureConnection(); // triggers pairing/bonding if needed
+  gClient->secureConnection(); // triggers pairing if needed
 
   gSvc = gClient->getService(SVC_UUID);
-  if (!gSvc) {
-    Serial.println("[Device] Service not found; disconnect.");
-    gClient->disconnect(); g_connected = false; g_haveTarget = false;
-    return false;
-  }
+  if (!gSvc) { Serial.println("[Device] Service missing; disconnect."); gClient->disconnect(); g_connected=false; g_haveTarget=false; return false; }
 
   gCtrl = gSvc->getCharacteristic(CTRL_UUID);
   if (!gCtrl || !gCtrl->canWriteNoResponse()) {
-    Serial.println("[Device] CTRL char missing or no WNR; disconnect.");
-    gClient->disconnect(); g_connected = false; g_haveTarget = false;
-    return false;
+    Serial.println("[Device] CTRL missing or no WNR; disconnect.");
+    gClient->disconnect(); g_connected=false; g_haveTarget=false; return false;
   }
 
   Serial.println("[Device] Ready to stream control frames.");
@@ -128,47 +176,61 @@ void setup() {
 
   NimBLEDevice::init(DEVICE_NAME);
   NimBLEDevice::setPower(ESP_PWR_LVL_P9);
-  NimBLEDevice::setMTU(247); // global MTU
+  NimBLEDevice::setMTU(247);
 
-  // Security: Bond + MITM + LE Secure Connections (Numeric Comparison)
-  NimBLEDevice::setSecurityAuth(true, true, true);
-  NimBLEDevice::setSecurityIOCap(BLE_HS_IO_DISPLAY_YESNO);
+  NimBLEDevice::setSecurityAuth(true, true, true);          // bond+MITM+SC
+  NimBLEDevice::setSecurityIOCap(BLE_HS_IO_DISPLAY_YESNO);  // Numeric Comparison
   NimBLEDevice::setSecurityPasskey(g_passkey);
 }
 
 void loop() {
-  static bool wasPressed = false;
-  const bool pressed = (digitalRead(PIN_USER_BTN) == LOW);
+  static bool btnPrev = true;
+  static uint32_t tPress = 0;
 
-  // Press -> start scan (if not already connected/target queued)
-  if (pressed && !wasPressed && !g_connected && !g_haveTarget) {
-    startScanFast();
+  bool btn = (digitalRead(PIN_USER_BTN) == LOW);
+
+  // Edge detection
+  if (btn && !btnPrev) tPress = millis();
+  if (!btn && btnPrev) {
+    uint32_t dur = millis() - tPress;
+    if (dur >= LONG_PRESS_MS) {
+      // LONG press: enter pairing-attempt window (30s)
+      g_pairAttempt = true;
+      g_pairUntil   = millis() + PAIR_ATTEMPT_MS;
+      Serial.println("[Device] Pairing-attempt window OPEN (30 s)");
+      if (!g_connected && g_txEnabled && !g_scanning) startScanFast();
+    } else {
+      // SHORT press: toggle TX on/off
+      g_txEnabled = !g_txEnabled;
+      Serial.printf("[Device] TX %s\n", g_txEnabled ? "ON" : "OFF");
+      if (g_txEnabled) {
+        if (!g_connected && !g_haveTarget) startScanFast();
+      } else {
+        stopScan();
+        if (g_connected && gClient) { gClient->disconnect(); g_connected=false; }
+        g_haveTarget = false;
+      }
+    }
+  }
+  btnPrev = btn;
+
+  // Expire pairing-attempt window
+  if (g_pairAttempt && millis() > g_pairUntil) {
+    g_pairAttempt = false;
+    Serial.println("[Device] Pairing-attempt window CLOSED");
   }
 
-  // If we have a target queued by the scan callback, connect now (outside callback)
+  // If we queued a target from scan, connect now
   if (!g_connected && g_haveTarget) {
     if (!connectToTarget()) {
-      // connection failed; restart scan if still pressing
-      if (pressed) startScanFast();
+      // connection failed; restart scan if TX is still on (short press toggled on)
+      if (g_txEnabled) startScanFast();
     }
   }
 
-  // Release -> stop scanning / disconnect
-  if (!pressed && wasPressed) {
-    stopScan();
-    if (g_connected && gClient) {
-      gClient->disconnect();
-      g_connected = false;
-      Serial.println("[Device] Disconnected (button release).");
-    }
-    g_haveTarget = false; // clear any queued target
-  }
-  wasPressed = pressed;
-
-  // Stream small control frames at high rate while connected
-  if (g_connected && gCtrl) {
-    static uint32_t tLast = 0;
-    uint32_t now = micros();
+  // Stream small frames at high rate while connected and TX on
+  if (g_connected && gCtrl && g_txEnabled) {
+    static uint32_t tLast = 0; uint32_t now = micros();
     if (now - tLast >= 3300) { // ~300 Hz
       tLast = now;
       uint8_t pkt[8];
